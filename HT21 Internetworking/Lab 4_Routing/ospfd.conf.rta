@@ -1,0 +1,28 @@
+!
+! Zebra configuration saved from vty
+!   2021/10/08 16:00:44
+!
+hostname ospfd
+password zebra
+log stdout
+!
+!
+!
+interface eth0
+!
+interface eth1
+!
+interface eth2
+!
+interface eth3
+!
+interface lo
+!
+router ospf
+ ospf router-id 172.16.49.1
+ network 172.16.1.0/24 area 0.0.0.0
+ network 172.16.49.0/24 area 0.0.0.0
+ default-information originate always
+!
+line vty
+!
