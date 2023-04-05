@@ -9,10 +9,10 @@ Code for projects at KTH
           EQ2310 Digital Communications
           
           EQ2330 Image and Video Processing
-          
-   2022 VT
    
           BSc Degree Project (HIT): Uncertainty Estimation of Deep Learning-based Glioma MR Image Segmentation
+          
+   2022 VT
           
           EQ2321 Speech and Audio Processing
           
