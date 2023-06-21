@@ -1,0 +1,23 @@
+FROM gcc:4.9
+MAINTAINER yuqizh<yuqizh@kth.se>
+
+# install cmake
+RUN apt-get update
+RUN apt-get install -y --force-yes build-essential libssl-dev
+
+COPY . /usr/src/myapp
+WORKDIR /usr/src/myapp/Downloads/cmake-3.17.3/
+
+RUN chmod u+x ./bootstrap
+RUN ./bootstrap
+RUN make
+RUN make install
+RUN cmake --version
+ 
+# complie Ladder
+WORKDIR /usr/src/myapp/Ladder/
+RUN chmod u+x ./setup_linux.sh
+RUN ./setup_linux.sh
+WORKDIR /usr/src/myapp/Ladder/Ladder/build
+
+CMD /bin/bash

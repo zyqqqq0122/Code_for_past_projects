@@ -1,0 +1,2 @@
+#/bin/bash 
+docker run -it --rm -v /mnt/c/users/yuqiz/downloads/test_0310/:/usr/src/myapp/volume/ --name c1_ladder ladder
