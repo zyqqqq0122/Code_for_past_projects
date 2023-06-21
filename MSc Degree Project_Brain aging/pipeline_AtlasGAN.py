@@ -1,24 +1,23 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
-import numpy as np
-import tensorflow as tf
+import argparse
 import os
 import random
-import argparse
 
+import SimpleITK as sitk
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import tensorflow.keras.layers as KL
+import voxelmorph as vxm
 from numpy.random import seed
 from tensorflow.compat.v1 import set_random_seed
-
-from src.networks import Generator
-import pandas as pd
-import tensorflow.keras.layers as KL
+from voxelmorph.tf.layers import SpatialTransformer, VecInt, RescaleTransform
 
 # my import
 import visualize_tools as vt
-import voxelmorph as vxm
+from src.networks import Generator
 from src.networks import conv_block
-from neurite.tf.layers import MeanStream
-from voxelmorph.tf.layers import SpatialTransformer, VecInt, RescaleTransform
 
 # ----------------------------------------------------------------------------
 # Set up CLI arguments:
@@ -77,8 +76,8 @@ parser.add_argument('--lazy_reg', type=int, default=1)  # Not used in the paper.
 
 # my arguments
 parser.add_argument('--checkpoint_path', type=str,
-                    default='/home/data/models_and_data/gploss_1e_4_dataset_OASIS3_eps200_Gconfig_ours_normreg_True_lrg0.0001_lrd0.0003_cond_True_regloss_NCC_lbdgan_0.1_lbdreg_1.0_lbdtv_0.0_lbdgp_0.0001_dsnout_False_start_0_clip_True/')
-parser.add_argument('--save_path', type=str, default='/home/data/test_0319/')
+                    default='/home/data/jrfu/data/trained_models/HC_only/training_checkpoints/gploss_1e_4_dataset_OASIS3_single_cohort_eps300_Gconfig_ours_normreg_True_lrg0.0001_lrd0.0003_cond_True_regloss_NCC_lbdgan_0.1_lbdreg_1.0_lbdtv_0.0_lbdgp_0.0001_dsnout_False_start_0_clip_True/')
+parser.add_argument('--save_path', type=str, default='/home/data/test_0420/')
 
 args = parser.parse_args()
 
@@ -117,14 +116,12 @@ g_ch = args.g_ch
 d_ch = args.d_ch
 init = args.init
 lazy_reg = args.lazy_reg
-
 # ----------------------------------------------------------------------------
 # Set RNG seeds
 
 seed(rng_seed)
 set_random_seed(rng_seed)
 random.seed(rng_seed)
-
 # ----------------------------------------------------------------------------
 # Initialize data generators
 
@@ -140,11 +137,10 @@ elif dataset == 'pHD':
     avg_path = './data/predict-hd/linearaverageof100.npz'
     n_condns = 3
 elif dataset == 'OASIS3':
-    # main_path = '/media/fjr/My Passport/data/OASIS3/' # /data/OASIS3/ or /proj/OASIS3_atlasGAN/ or /media/fjr/My Passport/data/OASIS3/
-    main_path = '/home/data/models_and_data/OASIS3/'
+    main_path = '/home/data/jrfu/data/OASIS3/'  # /media/fjr/My Passport/data/OASIS3/ or /data/OASIS3/ or /proj/OASIS3_atlasGAN/ or /media/fjr/My Passport/data/OASIS3/
     fpath = main_path + 'all_npz/'
     avg_path = main_path + 'linearaverageof100.npz'
-    n_condns = 3
+    n_condns = 1  # single cohort: 1, mix: 3
 else:
     raise ValueError('dataset expected to be dHCP, pHD or OASIS3')
 
@@ -167,10 +163,8 @@ vol_shape = avg_img.shape  # calculate [208, 176, 160] for OASIS3 dataset
 avg_batch = np.repeat(
     avg_img[np.newaxis, ...], batch_size, axis=0,
 )[..., np.newaxis]
-
-
 # ----------------------------------------------------------------------------
-# Initialize networks
+# Initialize generator (registration included) networks
 
 generator = Generator(
     ch=g_ch,
@@ -183,13 +177,12 @@ generator = Generator(
     n_condns=n_condns,
 )
 
-# ----------------------------------------------------------------------------
-# Set up Checkpoints
+# set up checkpoints
 checkpoint = tf.train.Checkpoint(
     generator=generator,
 )
 
-# restore checkpoint from the latest trained model:
+# restore checkpoint from the latest trained model
 if checkpoint_path:
     checkpoint.restore(
         tf.train.latest_checkpoint(checkpoint_path)
@@ -197,36 +190,9 @@ if checkpoint_path:
 else:
     raise ValueError('Testing phase, please provide checkpoint path!')
 
-# observe model layers
-def observe_model(generator):
-    count = 0
-    num_trainable_weights = 0
-    num_non_trainable_weights = 0
-    for layer_id, layer in enumerate(generator.layers):
-        if len(layer.trainable_weights) > 0:
-            print(f'{layer_id}: {count}th trainable layer, name = {layer.name}, '
-                  f'trainable_weights = {len(layer.trainable_weights)}, non_trainable_weights = {len(layer.non_trainable_weights)}')
-            count+=1
-        if len(layer.trainable_weights)>0:
-            num_trainable_weights += len(layer.trainable_weights)
-        if len(layer.non_trainable_weights) > 0:
-            num_non_trainable_weights += len(layer.non_trainable_weights)
 
-    print(f'trainable weights total = {num_trainable_weights}, non trainable = {num_non_trainable_weights}')
-    # trainable weights total = 101, non trainable = 16
-
-# # observe weights, reference page: https://www.tensorflow.org/guide/checkpoint
-# reader = tf.train.load_checkpoint(tf.train.latest_checkpoint(checkpoint_path))
-# shape_from_key = reader.get_variable_to_shape_map()
-# dtype_from_key = reader.get_variable_to_dtype_map()
-#
-# for key in sorted(shape_from_key.keys()):
-#     if key.startswith("generator/"):
-#         print(f'{key}')
-
-# so, there are 58 trainable layers and 58 saved keys. Should be able to load weight one layer by one layer
-
-
+# ----------------------------------------------------------------------------
+# Initialize registration network
 
 # define a registration model
 def Registration(
@@ -287,10 +253,10 @@ def Registration(
     # Get diffeomorphic displacement field:
     diff_field = VecInt(method='ss', int_steps=5, name='def_field')(vel)
 
-    # # Get moving average of deformations:
+    # Get moving average of deformations:
     # diff_field_ms = MeanStream(name='mean_stream', cap=100)(diff_field)
-    #
-    # # compute regularizers on diff_field_half for efficiency:
+
+    # compute regularizers on diff_field_half for efficiency:
     # diff_field_half = 1.0 * diff_field
     vel_field = RescaleTransform(2.0, name='flowup_vel_field')(vel)
     diff_field = RescaleTransform(2.0, name='flowup')(diff_field)
@@ -303,6 +269,7 @@ def Registration(
     )
 
 
+# Initialize registration model
 registration_model = Registration(
     ch=g_ch,
     normreg=norm_reg,
@@ -310,9 +277,41 @@ registration_model = Registration(
 )
 
 
-observe_model(generator)
-observe_model(registration_model)
+# ----------------------------------------------------------------------------
+# Set weights for registration network layers and save registration model
 
+# Observe model layers
+def observe_model(generator):
+    count = 0
+    num_trainable_weights = 0
+    num_non_trainable_weights = 0
+    for layer_id, layer in enumerate(generator.layers):
+        if len(layer.trainable_weights) > 0:
+            print(f'{layer_id}: {count}th trainable layer, name = {layer.name}, '
+                  f'trainable_weights = {len(layer.trainable_weights)}, non_trainable_weights = {len(layer.non_trainable_weights)}')
+            count += 1
+        if len(layer.trainable_weights) > 0:
+            num_trainable_weights += len(layer.trainable_weights)
+        if len(layer.non_trainable_weights) > 0:
+            num_non_trainable_weights += len(layer.non_trainable_weights)
+
+    print(f'trainable weights total = {num_trainable_weights}, non trainable = {num_non_trainable_weights}')
+    # trainable weights total = 101, non trainable = 16
+
+
+# observe weights, reference page: https://www.tensorflow.org/guide/checkpoint
+# reader = tf.train.load_checkpoint(tf.train.latest_checkpoint(checkpoint_path))
+# shape_from_key = reader.get_variable_to_shape_map()
+# dtype_from_key = reader.get_variable_to_dtype_map()
+
+# for key in sorted(shape_from_key.keys()):
+#     if key.startswith("generator/"):
+#         print(f'{key}')
+
+# so, there are 58 trainable layers and 58 saved keys. Should be able to load weight one layer by one layer
+
+# observe_model(generator)
+# observe_model(registration_model)
 # weights_list = generator.get_weights() # 117 long
 
 # construct weight layer names
@@ -320,30 +319,28 @@ def get_layers_name_with_weights(generator):
     weights_layers = []
     for layer_id, layer in enumerate(generator.layers):
         if len(layer.trainable_weights) > 0 or len(layer.non_trainable_weights) > 0:
-            # print(f'{layer_id}th layer, name = {layer.name}, '
-            #       f'trainable_weights = {len(layer.trainable_weights)}, non_trainable_weights = {len(layer.non_trainable_weights)}')
-            # repeat_times = len(layer.trainable_weights) + len(layer.non_trainable_weights)
-            # for i in range(repeat_times):
-            #     weights_layers.append(layer.name)
+            # print(f'{layer_id}th layer, name = {layer.name}, ' f'trainable_weights = {len(
+            # layer.trainable_weights)}, non_trainable_weights = {len(layer.non_trainable_weights)}') repeat_times =
+            # len(layer.trainable_weights) + len(layer.non_trainable_weights) for i in range(repeat_times):
+            # weights_layers.append(layer.name)
             weights_layers.append(layer.name)
     return weights_layers
 
+
 weights_layers_generator = get_layers_name_with_weights(generator)
-weights_layers_registration=get_layers_name_with_weights(registration_model)
+weights_layers_registration = get_layers_name_with_weights(registration_model)
 # load weight layer by layer, references: https://www.gcptutorials.com/post/how-to-get-weights-of-layers-in-tensorflow
 # https://stackoverflow.com/questions/43702323/how-to-load-only-specific-weights-on-keras
 start_generator = weights_layers_generator.index('conv3d_12')
 for i, layer in enumerate(weights_layers_registration):
-    generator_layer = weights_layers_generator[start_generator+i]
+    generator_layer = weights_layers_generator[start_generator + i]
     print(f'Loading weights for layer {layer} from generator layer {generator_layer}')
     registration_model.get_layer(layer).set_weights(generator.get_layer(generator_layer).get_weights())
 
 print("loading end")
 
-
-
 # save registration model
-checkpoint_dir = '/home/data/models_and_data/registration_model/'
+checkpoint_dir = '/home/data/test_0420/models_and_data/registration_model/'
 checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
 checkpoint = tf.train.Checkpoint(
     registration_model=registration_model,
@@ -351,13 +348,16 @@ checkpoint = tf.train.Checkpoint(
 checkpoint.save(file_prefix=checkpoint_prefix)
 
 
-# load the saved registration model:
-checkpoint_dir = '/home/data/models_and_data/registration_model/'
-checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+# ----------------------------------------------------------------------------
+# Load the saved registration model
+
+# set up checkpoint
 checkpoint = tf.train.Checkpoint(
     registration_model=registration_model,
 )
-checkpoint_path = '/home/data/models_and_data/registration_model/'
+
+# restore checkpoint from the saved model
+checkpoint_path = '/home/data/test_0420/models_and_data/registration_model/'
 if checkpoint_path:
     checkpoint.restore(
         tf.train.latest_checkpoint(checkpoint_path)
@@ -366,7 +366,11 @@ else:
     raise ValueError('Testing phase, please provide checkpoint path!')
 
 
-# given two inputs [fixed_image, moving_image], save [moved_atlas, diff_field, vel_field]
+# ----------------------------------------------------------------------------
+# Implement registration given:
+# two images input: [fixed_image, moving_image]
+# output: [moved_image, diff_field, vel_field], and save the SVF (vel_field)
+
 def extract_and_save(fixed_image, moving_image, save_path, save_name, save_moved_nii=False, save_vel_nii=False):
     os.makedirs(save_path, exist_ok=True)
 
@@ -375,205 +379,239 @@ def extract_and_save(fixed_image, moving_image, save_path, save_name, save_moved
 
     [moved_atlas, diff_field, vel_field] = registration_model([fixed_image, moving_image])
 
-    print(f'Moved image shape = {moved_atlas.numpy().squeeze().shape}, save as {save_path}{save_name}.')
+    print(f'Moved image shape = {moved_atlas.numpy().squeeze().shape}, save as {save_path}{save_name}_vel.nii.gz')
 
-    '''
-    np.savez_compressed(
-        save_path+save_name+'.npz',
-        moved= moved_atlas.numpy().squeeze(),
+    """ np.savez_compressed(
+        save_path + save_name + '.npz',
+        moved = moved_atlas.numpy().squeeze(),
         diff = diff_field.numpy().squeeze(),
         vel  = vel_field.numpy().squeeze()
-    )
-    '''
+    ) """
 
     if save_moved_nii is True:
         atlasmax = tf.reduce_max(moved_atlas).numpy()  # find the max value
         print("atlasmax = {}".format(atlasmax))
-
         template = tf.nn.relu(moved_atlas.numpy().squeeze()).numpy() / atlasmax  # with normalization
         # template = sharp_atlases.numpy().squeeze() # without normalization
-        # # use PSR transform as default affine
+        # use PSR transform as default affine
         # affine = np.array([[0, 0, -1, 0],  # nopep8
         #                    [1, 0, 0, 0],  # nopep8
         #                    [0, -1, 0, 0],  # nopep8
         #                    [0, 0, 0, 1]], dtype=float)  # nopep8
         # pcrs = np.append(np.array(template.shape[:3]) / 2, 1)
         # affine[:3, 3] = -np.matmul(affine, pcrs)[:3]
-        # vxm.py.utils.save_volfile(template, save_path+save_name+'_moved.nii.gz', affine)
+        # vxm.py.utils.save_volfile(template, save_path + save_name + '_moved.nii.gz', affine)
         vxm.py.utils.save_volfile(template, save_path + save_name + '_moved.nii.gz')
         vt.correct_vox2ras_matrix(save_path + save_name + '_moved.nii.gz')
 
     if save_vel_nii is True:
         # atlasmax = tf.reduce_max(vel_field).numpy() # find the max value
         # print("atlasmax = {}".format(atlasmax))
-
         # template = tf.nn.relu(vel_field.numpy().squeeze()).numpy()/ atlasmax  # with normalization
         # template = sharp_atlases.numpy().squeeze() # without normalization
-        # # use PSR transform as default affine
+        # use PSR transform as default affine
         # affine = np.array([[0, 0, -1, 0],  # nopep8
         #                    [1, 0, 0, 0],  # nopep8
         #                    [0, -1, 0, 0],  # nopep8
         #                    [0, 0, 0, 1]], dtype=float)  # nopep8
         # pcrs = np.append(np.array(template.shape[:3]) / 2, 1)
         # affine[:3, 3] = -np.matmul(affine, pcrs)[:3]
-        # vxm.py.utils.save_volfile(template, save_path+save_name+'_vel.nii.gz', affine)
+        # vxm.py.utils.save_volfile(template, save_path + save_name + '_vel.nii.gz', affine)
         vxm.py.utils.save_volfile(vel_field.numpy().squeeze(), save_path + save_name + '_vel.nii.gz')
         vt.correct_vox2ras_matrix(save_path + save_name + '_vel.nii.gz')
 
 
+# construct subject list: [subejct, src_subject_uid, src_age, dst_subject_uid, dst_age]
+def construct_subject_list(csv_path):
+    df = pd.read_csv(csv_path)
+    subject_list = df['subject'].value_counts().index
+    test_subject_list = []
+    for s in subject_list:
+        src_age = df['age_rounded'][df['subject'] == s][df['tag'] == 'src'].tolist()[0]
+        src_subject = df['uid'][df['subject'] == s][df['tag'] == 'src'].tolist()[0]
 
-# check if nii is in the same direction of avg
-import matplotlib.pyplot as plt
+        dst_age = df['age_rounded'][df['subject'] == s][df['tag'] == 'dst']
+        for d in dst_age:
+            dst_subject = df['uid'][df['subject'] == s][df['age_rounded'] == d].tolist()[0]
+            test_subject_list.append([s, src_subject, src_age, dst_subject, d])
 
-
-def show_3slice(load_train_img_np, title=''):
-    def show_slices(slices):
-        """ Function to display row of image slices """
-        fig, axes = plt.subplots(1, len(slices))
-        for i, slice in enumerate(slices):
-            axes[i].imshow(slice.T, cmap="gray", origin="lower")
-
-    H, W, C = load_train_img_np.shape
-    slice_0 = load_train_img_np[int(H / 2), :, :]
-    slice_1 = load_train_img_np[:, int(W / 2), :]
-    slice_2 = load_train_img_np[:, :, int(C / 2)]
-    show_slices([slice_0, slice_1, slice_2])
-    plt.suptitle(title)
-    plt.show()
+    return test_subject_list
 
 
+# implement template-to-template (t2t) or template-to-subject (t2s) registration and mask generation
+def registration_imp(subject_list, disease_code, path_prefix_m, path_prefix_f, save_path, nii_path, mask_path,
+                     flag='t2t'):
+    if flag == 't2t':
+        print('Implementing template-to-template registration...')
+        for i in subject_list:
+            moving_image = os.path.join(path_prefix_m, f'age_{i[2]}disease_{disease_code}.nii.gz')
+            fixed_image = os.path.join(path_prefix_f, f'age_{i[-1]}disease_{disease_code}.nii.gz')
+            save_name = f'T{i[2]}toT{i[-1]}_{disease_code}'
+            if not os.path.exists(save_path + save_name + '_vel.nii.gz'):
+                extract_and_save(np.transpose(vt.load_nii(fixed_image), (2, 1, 0))[np.newaxis, ..., np.newaxis],
+                                 np.transpose(vt.load_nii(moving_image), (2, 1, 0))[np.newaxis, ..., np.newaxis],
+                                 save_path, save_name,
+                                 save_moved_nii=False, save_vel_nii=True)
+            else:
+                print('Pass :)')
 
-# 0319 registration t2t:
-regis_list = [[73, 71], [73, 77], [73, 70], [73, 75], [71, 78], [77, 80],
-              [77, 76], [77, 72], [71, 65]]
+    elif flag == 't2s':
+        print('Implementing template-to-subject registration and mask generation...')
+        for i in subject_list:
+            moving_image = os.path.join(path_prefix_m, f'age_{i[2]}disease_{disease_code}.nii.gz')
+            fixed_image = os.path.join(path_prefix_f, f'{i[1]}.npz')
+            nii_name = os.path.join(nii_path, f'{i[1]}.nii.gz')
 
-for i in regis_list:
-    moving_image = f'/home/data/models_and_data/corrected_nii/age_{i[0]}disease_1.nii.gz'
-    fixed_image = f'/home/data/models_and_data/corrected_nii/age_{i[1]}disease_1.nii.gz'
-    save_path = '/home/data/test_0319/registration_t2t/AD/'
-    save_name = f'T{i[0]}to{i[1]}registration'
-    if not os.path.exists(save_path + save_name + '_vel.nii.gz'):
-        extract_and_save(np.transpose(vt.load_nii(fixed_image), (2, 1, 0))[np.newaxis, ..., np.newaxis],
-                         np.transpose(vt.load_nii(moving_image), (2, 1, 0))[np.newaxis, ..., np.newaxis],
-                         save_path, save_name,
-                         save_moved_nii=False, save_vel_nii=True)
+            if not os.path.exists(nii_name):
+                vt.npz2nii(fixed_image, nii_path, f'{i[1]}.nii.gz')
+                vt.correct_vox2ras_matrix(nii_name)
+
+            fixed_image = vt.load_nii(nii_name)
+            moving_image = vt.load_nii(moving_image)
+            save_name = f'T{i[2]}to{i[0]}_{disease_code}'
+            if not os.path.exists(save_path + save_name + '_vel.nii.gz'):
+                extract_and_save(np.transpose(fixed_image, (2, 1, 0))[np.newaxis, ..., np.newaxis],
+                                 np.transpose(moving_image, (2, 1, 0))[np.newaxis, ..., np.newaxis],
+                                 save_path, save_name,
+                                 save_moved_nii=False, save_vel_nii=True)
+            else:
+                print('Pass :)')
+
+            # mask generation
+            mask = np.where(fixed_image + moving_image > 0.0, 1.0, 0.0)
+            mask_name = f'{i[0]}_age_{i[2]}_{disease_code}_mask.nii.gz'
+            if not os.path.exists(mask_path + mask_name):
+                vt.np2nii(mask, mask_path, mask_name)
+            else:
+                print('Pass :)')
     else:
-        print('Pass :)')
+        print('Flag should be t2t or t2s.')
 
 
-# 0319 registration t2s:
-# regis_list = [['OAS30671', 'OAS30671_d1122', 71], ['OAS31114', 'OAS31114_d1442', 68], ['OAS31031', 'OAS31031_d1861', 65], ['OAS30006', 'OAS30006_d0373', 63], ['OAS31073', 'OAS31073_d2443', 72], ['OAS31025', 'OAS31025_d3510', 76], ['OAS31009', 'OAS31009_d3611', 69], ['OAS30933', 'OAS30933_d3460', 71], ['OAS30920', 'OAS30920_d1924', 68], ['OAS30919', 'OAS30919_d5473', 73], ['OAS30887', 'OAS30887_d2368', 67], ['OAS30881', 'OAS30881_d4295', 77], ['OAS30780', 'OAS30780_d1044', 78], ['OAS30759', 'OAS30759_d0063', 70], ['OAS30735', 'OAS30735_d2484', 64], ['OAS30723', 'OAS30723_d1179', 72], ['OAS30635', 'OAS30635_d1533', 73], ['OAS30126', 'OAS30126_d3465', 66], ['OAS30580', 'OAS30580_d1531', 72], ['OAS30579', 'OAS30579_d1232', 61], ['OAS30558', 'OAS30558_d0061', 64], ['OAS30537', 'OAS30537_d0029', 66], ['OAS30516', 'OAS30516_d1800', 72], ['OAS30476', 'OAS30476_d0482', 73], ['OAS30464', 'OAS30464_d0077', 61], ['OAS30449', 'OAS30449_d0000', 72], ['OAS30363', 'OAS30363_d2701', 78], ['OAS30291', 'OAS30291_d0078', 67], ['OAS30246', 'OAS30246_d0746', 75], ['OAS30178', 'OAS30178_d0049', 63], ['OAS30146', 'OAS30146_d2309', 75], ['OAS30143', 'OAS30143_d2235', 65], ['OAS31125', 'OAS31125_d0049', 72]]
-regis_list = [['OAS30775', 'OAS30775_d0999', 73], ['OAS30818', 'OAS30818_d1228', 73], ['OAS30263', 'OAS30263_d0129', 71], ['OAS30331', 'OAS30331_d3478', 77], ['OAS30804', 'OAS30804_d0507', 77], ['OAS30827', 'OAS30827_d1875', 77], ['OAS30921', 'OAS30921_d2464', 71]]
-
-for i in regis_list:
-    moving_image = f'/home/data/models_and_data/corrected_nii/age_{i[2]}disease_1.nii.gz'
-    fixed_image = f'/home/data/models_and_data/OASIS3/all_npz/{i[1]}.npz'
-    if not os.path.exists(f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz'):
-        vt.npz2nii(fixed_image, '/home/data/models_and_data/OASIS3/all_nii/', f'{i[1]}.nii.gz')
-        vt.correct_vox2ras_matrix(f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz')
-    fixed_image = f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz'
-    save_path = '/home/data/test_0319/registration_t2s/AD/'
-    save_name = f'T{i[2]}toS_{i[0]}_registration'
-    if not os.path.exists(save_path + save_name + '_vel.nii.gz'):
-        extract_and_save(np.transpose(vt.load_nii(fixed_image), (2, 1, 0))[np.newaxis, ..., np.newaxis],
-                         np.transpose(vt.load_nii(moving_image), (2, 1, 0))[np.newaxis, ..., np.newaxis],
-                         save_path, save_name,
-                         save_moved_nii=False, save_vel_nii=True)
-    else:
-        print('Pass :)')
+# save and read subject list
+def save_list(list_to_save, save_name, save_path):
+    file = open(f'{save_path}{save_name}.txt', 'w')
+    for s in list_to_save:
+        file.write(str(s))
+        file.write('\n')
+    file.close()
 
 
-# 0319 mask generation:
-regis_list = [['OAS30775', 'OAS30775_d0999', 73], ['OAS30818', 'OAS30818_d1228', 73], ['OAS30263', 'OAS30263_d0129', 71], ['OAS30331', 'OAS30331_d3478', 77], ['OAS30804', 'OAS30804_d0507', 77], ['OAS30827', 'OAS30827_d1875', 77], ['OAS30921', 'OAS30921_d2464', 71]]
+def read_list(list_name, list_path):
+    file = open(f'{list_path}{list_name}.txt', 'r')
+    X = file.readlines()
+    for i in range(len(X)):
+        X[i] = X[i].strip()
+        X[i] = X[i].strip("[]")
+        X[i] = X[i].split(",")
+        X[i] = [X[i][j].strip(" '") for j in range(len(X[i]))]
+    file.close()
 
-for i in regis_list:
-    moving_image = f'/home/data/models_and_data/corrected_nii/age_{i[2]}disease_1.nii.gz'
-    fixed_image = f'/home/data/models_and_data/OASIS3/all_npz/{i[1]}.npz'
-    if not os.path.exists(f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz'):
-        vt.npz2nii(fixed_image, '/home/data/models_and_data/OASIS3/all_nii/', f'{i[1]}.nii.gz')
-        vt.correct_vox2ras_matrix(f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz')
-    fixed_image = f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz'
-    fixed_image = vt.load_nii(fixed_image)
-    moving_image = vt.load_nii(moving_image)
-    img = fixed_image + moving_image
-    mask = np.where(img > 0.0, 1.0, 0.0)
-
-    save_path = '/home/data/test_0319/mask/'
-    save_name = f'S_{i[0]}_age_{i[2]}_mask.nii.gz'
-    if not os.path.exists(save_path + save_name):
-        vt.np2nii(mask, save_path, save_name)
-    else:
-        print('Pass :)')
+    return X
 
 
-# 0320 implement transformation:
-# subject_list = [['OAS30671', 'OAS30671_d1122', 71, 'OAS30671_d0267', 68], ['OAS30671', 'OAS30671_d1122', 71, 'OAS30671_d2486', 74], ['OAS30671', 'OAS30671_d1122', 71, 'OAS30671_d3613', 77], ['OAS31114', 'OAS31114_d1442', 68, 'OAS31114_d0695', 66], ['OAS31114', 'OAS31114_d1442', 68, 'OAS31114_d4375', 76], ['OAS31031', 'OAS31031_d1861', 65, 'OAS31031_d1119', 63], ['OAS31031', 'OAS31031_d1861', 65, 'OAS31031_d3596', 70], ['OAS30006', 'OAS30006_d0373', 63, 'OAS30006_d1308', 66], ['OAS31073', 'OAS31073_d2443', 72, 'OAS31073_d0779', 68], ['OAS31025', 'OAS31025_d3510', 76, 'OAS31025_d1258', 69], ['OAS31009', 'OAS31009_d3611', 69, 'OAS31009_d3330', 68], ['OAS30933', 'OAS30933_d3460', 71, 'OAS30933_d2167', 67], ['OAS30920', 'OAS30920_d1924', 68, 'OAS30920_d1125', 66], ['OAS30919', 'OAS30919_d5473', 73, 'OAS30919_d2502', 65], ['OAS30887', 'OAS30887_d2368', 67, 'OAS30887_d1407', 65], ['OAS30881', 'OAS30881_d4295', 77, 'OAS30881_d0304', 66], ['OAS30780', 'OAS30780_d1044', 78, 'OAS30780_d0055', 75], ['OAS30759', 'OAS30759_d0063', 70, 'OAS30759_d1408', 73], ['OAS30735', 'OAS30735_d2484', 64, 'OAS30735_d3515', 67], ['OAS30723', 'OAS30723_d1179', 72, 'OAS30723_d2278', 75], ['OAS30635', 'OAS30635_d1533', 73, 'OAS30635_d0544', 70], ['OAS30126', 'OAS30126_d3465', 66, 'OAS30126_d2361', 63], ['OAS30580', 'OAS30580_d1531', 72, 'OAS30580_d0032', 68], ['OAS30579', 'OAS30579_d1232', 61, 'OAS30579_d2400', 64], ['OAS30558', 'OAS30558_d0061', 64, 'OAS30558_d4493', 76], ['OAS30537', 'OAS30537_d0029', 66, 'OAS30537_d2813', 73], ['OAS30516', 'OAS30516_d1800', 72, 'OAS30516_d2706', 75], ['OAS30476', 'OAS30476_d0482', 73, 'OAS30476_d1931', 77], ['OAS30464', 'OAS30464_d0077', 61, 'OAS30464_d4293', 73], ['OAS30449', 'OAS30449_d0000', 72, 'OAS30449_d2359', 78], ['OAS30363', 'OAS30363_d2701', 78, 'OAS30363_d0880', 74], ['OAS30291', 'OAS30291_d0078', 67, 'OAS30291_d3148', 75], ['OAS30246', 'OAS30246_d0746', 75, 'OAS30246_d2354', 80], ['OAS30178', 'OAS30178_d0049', 63, 'OAS30178_d4730', 75], ['OAS30146', 'OAS30146_d2309', 75, 'OAS30146_d1042', 71], ['OAS30143', 'OAS30143_d2235', 65, 'OAS30143_d3507', 69], ['OAS31125', 'OAS31125_d0049', 72, 'OAS31125_d3093', 80]]
-subject_list = [['OAS30775', 'OAS30775_d0999', 73, 'OAS30775_d0183', 71], ['OAS30775', 'OAS30775_d0999', 73, 'OAS30775_d2381', 77], ['OAS30818', 'OAS30818_d1228', 73, 'OAS30818_d0097', 70], ['OAS30818', 'OAS30818_d1228', 73, 'OAS30818_d1720', 75], ['OAS30263', 'OAS30263_d0129', 71, 'OAS30263_d2483', 78], ['OAS30331', 'OAS30331_d3478', 77, 'OAS30331_d4694', 80], ['OAS30804', 'OAS30804_d0507', 77, 'OAS30804_d0086', 76], ['OAS30827', 'OAS30827_d1875', 77, 'OAS30827_d0043', 72], ['OAS30921', 'OAS30921_d2464', 71, 'OAS30921_d0382', 65]]
+disease_condn = 'HC'  # HC0/AD1
+disease_code = 0 if disease_condn == 'HC' else 1
+main_path = '/home/data/test_0420/'
+csv_path = main_path + f'models_and_data/FS_scans_test_{disease_condn}.csv'
+subject_list = construct_subject_list(csv_path)
+save_path = main_path + 'models_and_data/'
+save_list(subject_list, f'test_subject_list_{disease_condn}', save_path)
 
-for i in subject_list:
+# template-to-template registration (t2t)
+path_prefix_m = '/home/data/jrfu/data/trained_models/HC_only/plots/my_plot_1e-4/'
+path_prefix_f = '/home/data/jrfu/data/trained_models/HC_only/plots/my_plot_1e-4/'
+save_path = main_path + f'registration_t2t/{disease_condn}/'
+registration_imp(subject_list=subject_list,
+                 disease_code=disease_code,
+                 path_prefix_m=path_prefix_m,
+                 path_prefix_f=path_prefix_f,
+                 save_path=save_path,
+                 flag='t2t')
 
-    vel = f'/home/data/test_0319/registration_s2s/AD/S_{i[0]}_{i[2]}to{i[4]}_vel.nii.gz'
-    vel = vt.load_nii(vel)
-    vel = np.transpose(vel, (3, 2, 1, 0, 4))
-    vel = tf.convert_to_tensor(vel, dtype=tf.float32)
-
-    ref = f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz'
-    ref = vt.load_nii(ref)
-    ref = np.transpose(ref, (2, 1, 0))[np.newaxis, ..., np.newaxis]
-    ref = tf.convert_to_tensor(ref, dtype=tf.float32)
-
-    diff_field = VecInt(method='ss', int_steps=5, name='def_field')(vel)
-    pre = SpatialTransformer()([ref, diff_field])
-
-    pre_max = tf.reduce_max(pre).numpy()
-    subject_predicted = tf.nn.relu(pre.numpy().squeeze()).numpy() / pre_max
-    save_name = f'/home/data/test_0319/predictions/AD/pre_{i[0]}_{i[2]}to{i[4]}.nii.gz'
-    vxm.py.utils.save_volfile(subject_predicted, save_name)
-    vt.correct_vox2ras_matrix(save_name)
-
-# difference calculation:
-for i in subject_list:
-    gt_subject = f'/home/data/models_and_data/OASIS3/all_npz/{i[3]}.npz'
-    if not os.path.exists(f'/home/data/models_and_data/OASIS3/all_nii/{i[3]}.nii.gz'):
-        vt.npz2nii(gt_subject, '/home/data/models_and_data/OASIS3/all_nii/', f'{i[3]}.nii.gz')
-        vt.correct_vox2ras_matrix(f'/home/data/models_and_data/OASIS3/all_nii/{i[3]}.nii.gz')
-    gt_subject = f'/home/data/models_and_data/OASIS3/all_nii/{i[3]}.nii.gz'
-    gt_subject = vt.load_nii(gt_subject)
-    subject_predicted = vt.load_nii(f'/home/data/test_0319/predictions/AD/pre_{i[0]}_{i[2]}to{i[4]}.nii.gz')
-    diff_subject = subject_predicted - gt_subject
-    vt.np2nii(diff_subject, '/home/data/test_0319/difference/AD/', f'diff_{i[0]}_{i[2]}to{i[4]}.nii.gz')
+# template-to-subject registration (t2s), mask generation
+path_prefix_m = '/home/data/jrfu/data/trained_models/HC_only/plots/my_plot_1e-4/'
+path_prefix_f = '/home/data/jrfu/data/OASIS3/all_npz/'
+save_path = main_path + f'registration_t2s/{disease_condn}/'
+nii_path = '/home/data/jrfu/data/OASIS3/all_nii/'
+mask_path = main_path + f'mask/{disease_condn}/'
+registration_imp(subject_list=subject_list,
+                 disease_code=disease_code,
+                 path_prefix_m=path_prefix_m,
+                 path_prefix_f=path_prefix_f,
+                 save_path=save_path,
+                 nii_path=nii_path,
+                 mask_path=mask_path,
+                 flag='t2s')
 
 
-# 0323: test one transformation
-i = ['OAS30671', 'OAS30671_d1122', 71, 'OAS30671_d0267', 68]
-vel = f'/home/data/test_0319/test_sf/S_{i[0]}_{i[2]}to{i[4]}_sf_0_25_vel.nii.gz'
-vel = vt.load_nii(vel)
-vel = np.transpose(vel, (3, 2, 1, 0, 4))
-vel = tf.convert_to_tensor(vel, dtype=tf.float32)
+# ----------------------------------------------------------------------------
+# Implement parallel transport using Ladder, given:
+# ladder.sh, test_subject_list
 
-ref = f'/home/data/models_and_data/OASIS3/all_nii/{i[1]}.nii.gz'
-ref = vt.load_nii(ref)
-ref = np.transpose(ref, (2, 1, 0))[np.newaxis, ..., np.newaxis]
-ref = tf.convert_to_tensor(ref, dtype=tf.float32)
-
-diff_field = VecInt(method='ss', int_steps=5, name='def_field')(vel)
-pre = SpatialTransformer()([ref, diff_field])
-
-pre_max = tf.reduce_max(pre).numpy()
-subject_predicted = tf.nn.relu(pre.numpy().squeeze()).numpy() / pre_max
-save_name = f'/home/data/test_0319/test_sf/pre_{i[0]}_{i[2]}to{i[4]}_sf_0_25.nii.gz'
-vxm.py.utils.save_volfile(subject_predicted, save_name)
-vt.correct_vox2ras_matrix(save_name)
-
-gt_subject = f'/home/data/models_and_data/OASIS3/all_npz/{i[3]}.npz'
-if not os.path.exists(f'/home/data/models_and_data/OASIS3/all_nii/{i[3]}.nii.gz'):
-    vt.npz2nii(gt_subject, '/home/data/models_and_data/OASIS3/all_nii/', f'{i[3]}.nii.gz')
-    vt.correct_vox2ras_matrix(f'/home/data/models_and_data/OASIS3/all_nii/{i[3]}.nii.gz')
-    print('Saved!')
-gt_subject = f'/home/data/models_and_data/OASIS3/all_nii/{i[3]}.nii.gz'
-gt_subject = vt.load_nii(gt_subject)
-subject_predicted = vt.load_nii(f'/home/data/test_0319/test_sf/pre_{i[0]}_{i[2]}to{i[4]}_sf_0_25.nii.gz')
-diff_subject = subject_predicted - gt_subject
-vt.np2nii(diff_subject, '/home/data/test_0319/test_sf/', f'diff_{i[0]}_{i[2]}to{i[4]}_sf_0_25.nii.gz')
+# convert the output vel.mha to vel.nii.gz
+def mha2nii(mha_file, nii_file):
+    img = sitk.ReadImage(mha_file)
+    sitk.WriteImage(img, nii_file)
 
 
+disease_condn = 'HC'  # HC0/AD1
+main_path = '/home/data/test_0420/'
+mha_path = main_path + f'registration_s2s/mha/{disease_condn}/'
+nii_path = main_path + f'registration_s2s/nii/{disease_condn}/'
+files = os.listdir(mha_path)
+for f in files:
+    mha_file = os.path.join(mha_path, f)
+    mha2nii(mha_file, nii_path + f[: -4] + '.nii.gz')
+
+
+# ----------------------------------------------------------------------------
+# Implement transformation with parallel transported SVF and calculate the difference
+def transform_imp(subject_list, disease_code, vel_path, subject_path, nii_path, pre_path, diff_path, diff_cal=False):
+    for i in subject_list:
+        vel = os.path.join(vel_path, f'{i[0]}_{i[2]}to{i[4]}_{disease_code}_vel.nii.gz')
+        vel = vt.load_nii(vel)
+        vel = np.transpose(vel, (3, 2, 1, 0, 4))
+        vel = tf.convert_to_tensor(vel, dtype=tf.float32)
+
+        ref = os.path.join(nii_path, f'{i[1]}.nii.gz')
+        ref = vt.load_nii(ref)
+        ref = np.transpose(ref, (2, 1, 0))[np.newaxis, ..., np.newaxis]
+        ref = tf.convert_to_tensor(ref, dtype=tf.float32)
+
+        diff_field = VecInt(method='ss', int_steps=5, name='def_field')(vel)
+        pre = SpatialTransformer()([ref, diff_field])
+
+        pre_max = tf.reduce_max(pre).numpy()
+        subject_predicted = tf.nn.relu(pre.numpy().squeeze()).numpy() / pre_max
+        save_name = os.path.join(pre_path, f'pre_{i[0]}_{i[2]}to{i[4]}_{disease_code}.nii.gz')
+        vxm.py.utils.save_volfile(subject_predicted, save_name)
+        vt.correct_vox2ras_matrix(save_name)
+
+        if diff_cal:
+            gt_subject = os.path.join(subject_path, f'{i[3]}.npz')
+            if not os.path.exists(os.path.join(nii_path, f'{i[3]}.nii.gz')):
+                vt.npz2nii(gt_subject, nii_path, f'{i[3]}.nii.gz')
+                vt.correct_vox2ras_matrix(os.path.join(nii_path, f'{i[3]}.nii.gz'))
+            gt_subject = vt.load_nii(os.path.join(nii_path, f'{i[3]}.nii.gz'))
+            subject_predicted = vt.load_nii(save_name)
+            diff_subject = subject_predicted - gt_subject
+            vt.np2nii(diff_subject, diff_path, f'diff_{i[0]}_{i[2]}to{i[4]}_{disease_code}.nii.gz')
+
+
+disease_condn = 'HC'  # HC0/AD1
+disease_code = 0 if disease_condn == 'HC' else 1
+main_path = '/home/data/test_0420/'
+vel_path = main_path + f'registration_s2s/nii/{disease_condn}/'
+subject_path = '/home/data/jrfu/data/OASIS3/all_npz/'
+nii_path = '/home/data/jrfu/data/OASIS3/all_nii/'
+pre_path = main_path + f'predictions/{disease_condn}/'
+diff_path = main_path + f'difference/{disease_condn}/'
+transform_imp(subject_list=subject_list,
+              disease_code=disease_code,
+              vel_path=vel_path,
+              subject_path=subject_path,
+              nii_path=nii_path,
+              pre_path=pre_path,
+              diff_path=diff_path,
+              diff_cal=True)
